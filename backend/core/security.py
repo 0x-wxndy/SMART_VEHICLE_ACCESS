@@ -10,6 +10,7 @@ from jose import JWTError, jwt
 from passlib.context import CryptContext
 from fastapi import HTTPException, status, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from backend.schemas.auth import UserRole
 
 from backend.core.config import settings
 
@@ -162,13 +163,6 @@ def validate_api_key(api_key: str) -> bool:
     """
     # Basic format validation - should be 32+ characters
     return len(api_key) >= 32 and api_key.replace('-', '').replace('_', '').isalnum()
-
-# Role-based access control
-class UserRole:
-    """User roles for RBAC system."""
-    ADMIN = "admin"
-    OPERATOR = "operator"
-    VIEWER = "viewer"
 
 def check_permission(user_role: str, required_role: str) -> bool:
     """

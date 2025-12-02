@@ -1,22 +1,24 @@
-# Image processing and OCR pipeline for license plate recognition
+# Image processing and OCR for license plate recognition
 # Handles plate detection, character recognition, and image preprocessing
 
 import cv2
 import numpy as np
-from PIL import Image
 import torch
-from ultralytics import YOLO
-import easyocr
-import pytesseract
+from ultralytics import YOLO, utils
+from paddleocr import TextRecognition
 from typing import List, Tuple, Optional, Dict, Any
 import logging
 from datetime import datetime
 import os
-import json
+import re
+import openvino
 
 from backend.core.config import settings
 
 logger = logging.getLogger(__name__)
+utils.LOGGER.setLevel("ERROR")
+logger.setLevel(logging.INFO)
+
 
 class LicensePlateProcessor:
     """
@@ -27,6 +29,7 @@ class LicensePlateProcessor:
     def __init__(self):
         """Initialize the license plate processor with models and configurations."""
         self.detection_model = None
+        self.vehicle_detection_model = None
         self.ocr_reader = None
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         
@@ -36,29 +39,56 @@ class LicensePlateProcessor:
         # Processing parameters
         self.detection_confidence = settings.PLATE_DETECTION_CONFIDENCE
         self.ocr_confidence_threshold = settings.OCR_CONFIDENCE_THRESHOLD
-        
-        logger.info(f"LicensePlateProcessor initialized on device: {self.device}")
     
     def _load_models(self):
         """Load YOLO detection model and OCR reader."""
         try:
-            # Load YOLO model for plate detection
-            # In production, this should be a custom trained model for Algerian plates
             model_path = os.path.join(settings.MODELS_DIR, "yolo_plate_detection.pt")
-            
-            if os.path.exists(model_path):
-                self.detection_model = YOLO(model_path)
-            else:
-                # Use pre-trained YOLOv8 model as fallback
-                logger.warning("Custom plate detection model not found, using YOLOv8n")
-                self.detection_model = YOLO("yolov8n.pt")
-            
-            # Initialize EasyOCR reader for Arabic and Latin characters
-            # Supports Arabic (ar) and English (en) for Algerian plates
-            self.ocr_reader = easyocr.Reader(['en', 'ar'], gpu=torch.cuda.is_available())
-            
+            use_openvino = False
+
+            if not os.path.exists(model_path):
+                raise Exception("Custom plate detection model not found")
+
+            try:
+                if not self.device == "cpu":
+                    raise
+
+                core = openvino.Core()
+                if not "GPU" in core.available_devices:
+                    raise
+
+                openvino_path = "yolov8n_openvino_model"
+                if not os.path.exists(openvino_path):
+                    logger.info("Exporting YOLO model to OpenVINO format...")
+                    YOLO("yolov8n.pt").export(format="openvino")
+                    logger.info("OpenVINO export completed")
+
+                self.vehicle_detection_model = YOLO(openvino_path)
+
+                openvino_path = os.path.join(settings.MODELS_DIR, "yolo_plate_detection_openvino_model")
+                if not os.path.exists(openvino_path):
+                    logger.info("Exporting YOLO LP model to OpenVINO format...")
+                    YOLO(model_path).export(format="openvino")
+                    logger.info("OpenVINO export completed")
+
+                self.detection_model = YOLO(openvino_path)
+
+                use_openvino = True
+                logger.info("Using openvino for detection")
+            except:
+                pass
+
+            if not use_openvino:
+                self.vehicle_detection_model = YOLO("yolov8n.pt").to(self.device)
+                self.detection_model = YOLO(model_path).to(self.device)
+
+            self.ocr_reader = TextRecognition(
+                model_name="PP-OCRv5_mobile_rec",
+                device='gpu' if torch.cuda.is_available() else 'cpu',
+            )
+
             logger.info("Models loaded successfully")
-            
+
         except Exception as e:
             logger.error(f"Error loading models: {e}")
             raise
@@ -74,29 +104,25 @@ class LicensePlateProcessor:
             np.ndarray: Preprocessed image
         """
         try:
-            # Convert to grayscale if needed
-            if len(image.shape) == 3:
-                gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-            else:
-                gray = image.copy()
-            
-            # Apply CLAHE (Contrast Limited Adaptive Histogram Equalization)
-            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-            enhanced = clahe.apply(gray)
-            
-            # Denoise using bilateral filter
-            denoised = cv2.bilateralFilter(enhanced, 9, 75, 75)
-            
-            # Apply Gaussian blur to reduce noise
-            blurred = cv2.GaussianBlur(denoised, (3, 3), 0)
-            
-            return blurred
-            
+            # Simple contrast + brightness normalization
+            enhanced = cv2.convertScaleAbs(image, alpha=1.3, beta=10)
+
+            # Light sharpening (cheap)
+            kernel = np.array([[0, -1, 0],
+                               [-1, 5, -1],
+                               [0, -1, 0]])
+            sharpened = cv2.filter2D(enhanced, -1, kernel)
+
+            final = cv2.GaussianBlur(sharpened, (3, 3), 0)
+
+            return final
+
         except Exception as e:
             logger.error(f"Error preprocessing image: {e}")
             return image
-    
-    def detect_license_plates(self, image: np.ndarray) -> List[Dict[str, Any]]:
+
+
+    def detect_license_plates(self, image: np.ndarray, tracker) -> List[Dict[str, Any]]:
         """
         Detect license plates in the image using YOLO.
         
@@ -107,34 +133,45 @@ class LicensePlateProcessor:
             List[Dict]: List of detected plates with bounding boxes and confidence
         """
         try:
-            # Preprocess image
             processed_image = self.preprocess_image(image)
-            
-            # Run YOLO detection
-            results = self.detection_model(processed_image, conf=self.detection_confidence)
-            
-            detections = []
-            for result in results:
-                boxes = result.boxes
-                if boxes is not None:
-                    for box in boxes:
-                        # Extract bounding box coordinates
-                        x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-                        confidence = box.conf[0].cpu().numpy()
-                        
-                        # Convert to integers
-                        x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
-                        
-                        detections.append({
-                            'bbox': (x1, y1, x2, y2),
+
+            vehicles = []
+            detections = self.vehicle_detection_model(processed_image, conf=self.detection_confidence)[0]
+
+            for box in detections.boxes:
+                x1, y1, x2, y2 = map(int, box.xyxy[0].cpu().numpy())
+                confidence = box.conf[0].cpu().numpy()
+                class_id = int(box.cls[0].cpu().numpy())
+
+                if int(class_id) in [2, 5, 7]:
+                    vehicles.append([x1, y1, x2, y2, confidence])
+
+            if len(vehicles) == 0:
+                return []
+
+            tracked_vehicles = tracker.update(np.asarray(vehicles))
+
+            license_plates = []
+            detections = self.detection_model(processed_image, conf=self.detection_confidence)[0]
+
+            for box in detections.boxes:
+                x1, y1, x2, y2 = map(int, box.xyxy[0].cpu().numpy())
+                confidence = box.conf[0].cpu().numpy()
+
+                for vehicle in tracked_vehicles:
+                    car_x1, car_y1, car_x2, car_y2, id = vehicle
+
+                    if x1 > car_x1 and y1 > car_y1 and x2 < car_x2 and y2 < car_y2:
+                        license_plates.append({
+                            'id': int(id),
+                            'bbox': tuple(map(int, (x1, y1, x2, y2))),
+                            'vbbox': tuple(map(int, (car_x1, car_y1, car_x2, car_y2))),
                             'confidence': float(confidence),
-                            'width': x2 - x1,
-                            'height': y2 - y1
-                        })
+                            })
+                        break
             
-            logger.info(f"Detected {len(detections)} license plates")
-            return detections
-            
+            return license_plates
+
         except Exception as e:
             logger.error(f"Error detecting license plates: {e}")
             return []
@@ -192,26 +229,46 @@ class LicensePlateProcessor:
                 gray = cv2.cvtColor(plate_image, cv2.COLOR_BGR2GRAY)
             else:
                 gray = plate_image.copy()
-            
-            # Apply adaptive thresholding
-            thresh = cv2.adaptiveThreshold(
-                gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2
-            )
-            
+
+            gray = cv2.bilateralFilter(gray, 11, 17, 17)
+
+            # Deskew the image
+            edges = cv2.Canny(gray, 100, 200)
+            lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=40,
+                                    minLineLength=30, maxLineGap=100)
+
+            if lines is not None and len(lines) > 0:
+                angles = []
+                for line in lines:
+                    x1, y1, x2, y2 = line[0]
+                    angle_rad = np.arctan2(y2 - y1, x2 - x1)
+                    angle_deg = np.degrees(angle_rad)
+                    if -80 < angle_deg < 80:
+                        angles.append(angle_deg)
+
+                (h, w) = plate_image.shape[:2]
+                center = (w // 2, h // 2)
+                # angle = float(angles[0])
+                angle = float(np.mean(angles))
+
+                rotation_matrix = cv2.getRotationMatrix2D(center, angle, 1.0)
+                plate_image = cv2.warpAffine(plate_image, rotation_matrix, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+
             # Morphological operations to clean up the image
             kernel = np.ones((2, 2), np.uint8)
-            cleaned = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
-            
-            # Apply median filter to reduce noise
-            filtered = cv2.medianBlur(cleaned, 3)
-            
-            return filtered
-            
+            cleaned = cv2.morphologyEx(plate_image, cv2.MORPH_CLOSE, kernel)
+
+            return cleaned
+
         except Exception as e:
             logger.error(f"Error enhancing plate image: {e}")
             return plate_image
+
+    def _validate_plate_text(self, text: str) -> bool:
+        pattern = re.compile(r'^\d{10,11}$')
+        return bool(pattern.match(text))
     
-    def recognize_plate_text(self, plate_image: np.ndarray) -> Dict[str, Any]:
+    def recognize_plate_text(self, plate_image: np.ndarray, track_id: int) -> Dict[str, Any]:
         """
         Recognize text from license plate image using OCR.
         
@@ -225,41 +282,22 @@ class LicensePlateProcessor:
             # Enhance the plate image
             enhanced_image = self.enhance_plate_image(plate_image)
             
-            # Try EasyOCR first (better for Arabic characters)
-            easyocr_results = self.ocr_reader.readtext(enhanced_image)
-            
-            # Process EasyOCR results
-            if easyocr_results:
-                # Get the result with highest confidence
-                best_result = max(easyocr_results, key=lambda x: x[2])
-                text, confidence = best_result[1], best_result[2]
-                
-                # Clean and normalize text
+            paddleocr_results = self.ocr_reader.predict(enhanced_image, batch_size=1)
+
+            if len(paddleocr_results) > 0:
+                text = paddleocr_results[0].get('rec_text') or ""
+                confidence = paddleocr_results[0].get('rec_score') or 0
+
                 cleaned_text = self._clean_plate_text(text)
-                
-                if confidence >= self.ocr_confidence_threshold:
+
+                if confidence >= self.ocr_confidence_threshold and self._validate_plate_text(cleaned_text):
                     return {
                         'text': cleaned_text,
                         'confidence': confidence,
-                        'method': 'easyocr',
+                        'method': 'paddleocr',
                         'raw_text': text
                     }
-            
-            # Fallback to Tesseract OCR
-            tesseract_text = pytesseract.image_to_string(
-                enhanced_image, 
-                config='--psm 8 -c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ'
-            ).strip()
-            
-            if tesseract_text:
-                cleaned_text = self._clean_plate_text(tesseract_text)
-                return {
-                    'text': cleaned_text,
-                    'confidence': 0.7,  # Default confidence for Tesseract
-                    'method': 'tesseract',
-                    'raw_text': tesseract_text
-                }
-            
+
             return {
                 'text': '',
                 'confidence': 0.0,
@@ -291,70 +329,31 @@ class LicensePlateProcessor:
             # Remove extra whitespace and convert to uppercase
             cleaned = text.strip().upper()
             
-            # Remove non-alphanumeric characters except spaces
-            cleaned = ''.join(c for c in cleaned if c.isalnum() or c.isspace())
-            
-            # Remove extra spaces
-            cleaned = ' '.join(cleaned.split())
-            
             # Common character corrections for Algerian plates
             corrections = {
                 'O': '0',  # Letter O to number 0
                 'I': '1',  # Letter I to number 1
                 'S': '5',  # Letter S to number 5
                 'B': '8',  # Letter B to number 8
+                'G': '6',
+                '|': '1',
+                ']': '1',
+                'J': '3',
+                'A': '4'
             }
             
             # Apply corrections
             for old, new in corrections.items():
                 cleaned = cleaned.replace(old, new)
+
+            cleaned = ''.join(c for c in cleaned if c.isalnum())
+            # cleaned = ' '.join(cleaned.split())
             
             return cleaned
             
         except Exception as e:
             logger.error(f"Error cleaning plate text: {e}")
             return text
-    
-    def process_image(self, image: np.ndarray) -> List[Dict[str, Any]]:
-        """
-        Complete pipeline: detect plates and recognize text.
-        
-        Args:
-            image: Input image as numpy array
-            
-        Returns:
-            List[Dict]: List of processed plate detections with text recognition
-        """
-        try:
-            start_time = datetime.now()
-            
-            # Detect license plates
-            detections = self.detect_license_plates(image)
-            
-            results = []
-            for detection in detections:
-                # Extract plate ROI
-                plate_roi = self.extract_plate_roi(image, detection['bbox'])
-                
-                # Recognize text
-                ocr_result = self.recognize_plate_text(plate_roi)
-                
-                # Combine detection and OCR results
-                result = {
-                    'detection': detection,
-                    'ocr': ocr_result,
-                    'overall_confidence': (detection['confidence'] + ocr_result['confidence']) / 2,
-                    'processing_time_ms': (datetime.now() - start_time).total_seconds() * 1000
-                }
-                
-                results.append(result)
-            
-            logger.info(f"Processed {len(results)} plates in {results[0]['processing_time_ms']:.2f}ms")
-            return results
-            
-        except Exception as e:
-            logger.error(f"Error processing image: {e}")
-            return []
     
     def save_plate_thumbnail(self, plate_image: np.ndarray, detection_id: str) -> str:
         """
@@ -387,128 +386,25 @@ class LicensePlateProcessor:
             logger.error(f"Error saving plate thumbnail: {e}")
             return ""
 
-class VideoProcessor:
-    """
-    Video processing class for handling video streams and files.
-    Supports RTSP streams, video files, and real-time processing.
-    """
-    
-    def __init__(self, plate_processor: LicensePlateProcessor):
-        """
-        Initialize video processor.
-        
-        Args:
-            plate_processor: LicensePlateProcessor instance
-        """
-        self.plate_processor = plate_processor
-        self.cap = None
-        self.frame_count = 0
-        
-    def open_stream(self, stream_url: str) -> bool:
-        """
-        Open video stream (RTSP, HTTP, or file).
-        
-        Args:
-            stream_url: URL or path to video stream
-            
-        Returns:
-            bool: True if stream opened successfully
-        """
-        try:
-            self.cap = cv2.VideoCapture(stream_url)
-            
-            if not self.cap.isOpened():
-                logger.error(f"Failed to open stream: {stream_url}")
-                return False
-            
-            # Set buffer size to reduce latency
-            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            
-            logger.info(f"Successfully opened stream: {stream_url}")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error opening stream: {e}")
-            return False
-    
-    def read_frame(self) -> Optional[np.ndarray]:
-        """
-        Read next frame from video stream.
-        
-        Returns:
-            np.ndarray: Frame data or None if no frame available
-        """
-        try:
-            if self.cap is None:
-                return None
-            
-            ret, frame = self.cap.read()
-            if ret:
-                self.frame_count += 1
-                return frame
-            else:
-                return None
-                
-        except Exception as e:
-            logger.error(f"Error reading frame: {e}")
-            return None
-    
-    def process_video_stream(self, stream_url: str, callback=None) -> None:
-        """
-        Process video stream continuously.
-        
-        Args:
-            stream_url: URL or path to video stream
-            callback: Optional callback function for processing results
-        """
-        try:
-            if not self.open_stream(stream_url):
-                return
-            
-            logger.info(f"Starting video stream processing: {stream_url}")
-            
-            while True:
-                frame = self.read_frame()
-                if frame is None:
-                    break
-                
-                # Process frame for license plates
-                results = self.plate_processor.process_image(frame)
-                
-                # Call callback if provided
-                if callback and results:
-                    callback(results, frame, self.frame_count)
-                
-                # Break on 'q' key press (for testing)
-                if cv2.waitKey(1) & 0xFF == ord('q'):
-                    break
-            
-        except Exception as e:
-            logger.error(f"Error processing video stream: {e}")
-        finally:
-            self.close_stream()
-    
-    def close_stream(self):
-        """Close video stream."""
-        if self.cap:
-            self.cap.release()
-            cv2.destroyAllWindows()
-            logger.info("Video stream closed")
-    
-    def get_stream_info(self) -> Dict[str, Any]:
-        """
-        Get video stream information.
-        
-        Returns:
-            Dict: Stream properties
-        """
-        if self.cap is None:
-            return {}
-        
-        return {
-            'width': int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
-            'height': int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
-            'fps': self.cap.get(cv2.CAP_PROP_FPS),
-            'frame_count': self.frame_count,
-            'is_opened': self.cap.isOpened()
-        }
+    def annotate_frame(self, frame: np.ndarray, detections) -> np.ndarray:
+        annotated_frame = frame.copy()
+
+        for detection in detections:
+            id = detection['id']
+            car_x1, car_y1, car_x2, car_y2 = detection['vbbox']
+            x1, y1, x2, y2 = detection['bbox']
+            overall_confidence = float(detection['overall_confidence'])
+            ocr_reading = detection['ocr']['text']
+
+            # TODO make color dynamic
+            color = (0, 255, 0)
+
+            cv2.rectangle(annotated_frame, (car_x1, car_y1), (car_x2, car_y2), color, 2)
+            car_label = f"Vehicle {id}"
+            cv2.putText( annotated_frame, car_label, (car_x1, max(car_y1 - 10, 20)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA)
+
+            cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, 2)
+            label = f"{ocr_reading} ({overall_confidence:.2f})"
+            cv2.putText( annotated_frame, label, (x1, max(y1 - 10, 20)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA)
+
+        return annotated_frame

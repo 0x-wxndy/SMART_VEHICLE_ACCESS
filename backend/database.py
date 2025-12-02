@@ -1,7 +1,7 @@
 # Database connection and session management
 # Handles PostgreSQL connection, session creation, and initialization
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker, Session
 from sqlalchemy.pool import StaticPool
@@ -9,7 +9,7 @@ import asyncio
 from typing import Generator, AsyncGenerator
 
 from backend.core.config import settings
-from backend.models.database import Base
+from backend.models import Base
 
 # Create synchronous engine for migrations and initial setup
 engine = create_engine(
@@ -88,19 +88,20 @@ async def create_default_admin() -> None:
     Create default admin user if no users exist in the database.
     This ensures the system is accessible after initial setup.
     """
-    from backend.models.database import User
+    from backend.models import User
     from backend.core.security import get_password_hash
     
     async with AsyncSessionLocal() as session:
         # Check if any users exist
-        result = await session.execute("SELECT COUNT(*) FROM users")
+
+        result = await session.execute(text("SELECT COUNT(*) FROM users"))
         user_count = result.scalar()
         
         if user_count == 0:
             # Create default admin user
             admin_user = User(
                 username="admin",
-                email="admin@license-scanner.local",
+                email="admin@license-scanner.dz", # pydantic doesn't validate .local
                 hashed_password=get_password_hash("admin123"),  # Change in production!
                 role="admin",
                 is_active=True
